@@ -1,0 +1,17 @@
+# Render Blueprint：部署「原生 DeepSeek 版」短剧带货脚本引擎
+# 在 Render 控制台 New → Blueprint → 连接本仓库即可，自动建 Web Service。
+# 构建：npm install && npm run build ；启动：node server/proxy.cjs
+# 部署后在前端「设置」选择「自托管代理」模式，填入你的 DeepSeek Key 即可使用。
+services:
+  - type: web
+    name: drama-selling-engine
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node server/proxy.cjs
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: UPSTREAM
+        value: "https://api.deepseek.com"

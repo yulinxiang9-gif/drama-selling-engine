@@ -1,0 +1,20 @@
+{
+  "name": "drama-selling-engine",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "短剧带货脚本引擎 — 用短剧剧情把产品卖点自然植入，生成可直接投喂 Seedance 的分镜脚本",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --host"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11"
+  }
+}

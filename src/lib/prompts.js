@@ -1,5 +1,5 @@
-import { DURATIONS, PLATFORMS, BANNED_WORDS } from './constants'
-import { getStyle } from './dramaStyles'
+import { DURATIONS, PLATFORMS, BANNED_WORDS } from './constants.js'
+import { getStyle } from './dramaStyles.js'
 
 // ---------- 商品事实结构化 ----------
 export function productFactsText(p) {

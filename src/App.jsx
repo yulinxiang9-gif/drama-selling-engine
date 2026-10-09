@@ -1,10 +1,14 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { PROVIDERS, DURATIONS, PLATFORMS, TONES, BANNED_WORDS, scanBannedWords } from './lib/constants'
 import { DRAMA_STYLES, getStyle } from './lib/dramaStyles'
-import { productFactsText, buildPainMapMessages, buildDramaScriptMessages, buildRewriteMessages } from './lib/prompts'
+import { buildRewriteMessages } from './lib/prompts'
 import { chatCompletion, parseJSON } from './lib/llm'
-import { toMarkdown, toSeedancePrompts, download } from './lib/export'
+import { toMarkdown, toSeedancePrompts, toBatchMarkdown, toBatchJSON, download } from './lib/export'
 
+import { generateProduct } from './lib/generate'
+import { createBatch, normalizeProduct, runBatch } from './lib/batch'
+
+const LS_BATCH = 'dse_batch_v1'
 const LS_SETTINGS = 'dse_settings_v1'
 const LS_PRODUCT = 'dse_product_v1'
 const LS_LAST_HOOK = 'dse_last_hook_v1'
@@ -42,6 +46,17 @@ export default function App() {
   const [temperature, setTemperature] = useState(0.85)
   const [avoidRepeat, setAvoidRepeat] = useState(false)
 
+  const [mode, setMode] = useState('single')
+  const [batch, setBatch] = useState(() => {
+    const saved = loadJSON(LS_BATCH, null)
+    return Array.isArray(saved) && saved.length === 5 ? saved.map(item => ({ ...item, status: item.status === 'running' ? 'cancelled' : item.status })) : createBatch()
+  })
+  useEffect(() => {
+    try { localStorage.setItem(LS_BATCH, JSON.stringify(batch)) } catch { /* quota: results remain exportable */ }
+  }, [batch])
+  const updateItem = (id, updater) => setBatch(items => items.map(item => item.id === id ? updater(item) : item))
+  const updateProduct = (id, updater) => updateItem(id, item => ({ ...item, product: updater(item.product), status: 'pending', script: null, painMap: null, meta: null, compliance: [], error: '' }))
+
   const [showSettings, setShowSettings] = useState(false)
   const [loading, setLoading] = useState(false)
   const [step, setStep] = useState('')
@@ -56,11 +71,8 @@ export default function App() {
   useEffect(() => localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)), [settings])
   useEffect(() => localStorage.setItem(LS_PRODUCT, JSON.stringify(product)), [product])
 
-  // 把逗号/换行分隔的文本转数组
-  const arr = (txt) => (txt || '').split(/[\n,，、]/).map((s) => s.trim()).filter(Boolean)
-
   const productForEngine = useMemo(
-    () => ({ ...product, sellingPoints: arr(product._sp), scenarios: arr(product._sc) }),
+    () => normalizeProduct(product),
     [product]
   )
 
@@ -83,44 +95,12 @@ export default function App() {
     const ac = new AbortController()
     abortRef.current = ac
     try {
-      const p = productForEngine
-      // ① 痛点地图
-      setStep('① 正在生成痛点地图（把卖点翻译成可代入的困境）…')
-      const pmContent = await chatCompletion({
-        baseUrl: settings.baseUrl,
-        apiKey: settings.apiKey,
-        model: settings.model,
-        messages: buildPainMapMessages(p),
-        json: true,
-        temperature: Math.min(temperature, 0.7),
-        signal: ac.signal,
+      const { painMap: pm, script: sc } = await generateProduct({
+        p: productForEngine, settings, styleId, toneId, durationKey, platformId,
+        temperature, avoidHooks: avoidRepeat && lastHook ? [lastHook] : [],
+        signal: ac.signal, onStep: setStep, onPainMap: setPainMap,
       })
-      const pm = parseJSON(pmContent)
       setPainMap(pm)
-
-      // ② 短剧脚本
-      setStep('② 正在套用短剧结构生成分镜脚本（剧情 + 卖点融合）…')
-      const avoid = avoidRepeat && lastHook ? [lastHook] : []
-      const scContent = await chatCompletion({
-        baseUrl: settings.baseUrl,
-        apiKey: settings.apiKey,
-        model: settings.model,
-        messages: buildDramaScriptMessages({
-          p,
-          styleId,
-          toneId,
-          durationKey,
-          platformId,
-          painMap: pm,
-          bannedWords: BANNED_WORDS,
-          avoidHooks: avoid,
-        }),
-        json: true,
-        temperature,
-        maxTokens: 4000,
-        signal: ac.signal,
-      })
-      const sc = parseJSON(scContent)
       setScript(sc)
       if (sc?.hook) {
         localStorage.setItem(LS_LAST_HOOK, sc.hook)
@@ -134,6 +114,40 @@ export default function App() {
       else setError(e.message || String(e))
     } finally {
       setLoading(false)
+      setBusy(false)
+      setStep('')
+    }
+  }
+
+  async function generateBatch(onlyId) {
+    setError('')
+    if (!settings.apiKey || !settings.model) {
+      setShowSettings(true)
+      setError('请先填写 API Key 与模型。')
+      return
+    }
+    const targets = onlyId ? batch.filter(item => item.id === onlyId) : batch
+    if (targets.some(item => !item.product.name.trim() || !normalizeProduct(item.product).sellingPoints.length)) {
+      setError('请为每条填写商品名称和至少一条卖点；同一商品可以填写五组不同卖点。')
+      return
+    }
+    setBusy(true)
+    const ac = new AbortController()
+    abortRef.current = ac
+    try {
+      await runBatch(targets, async (item, avoidHooks) => {
+        const result = await generateProduct({
+          p: normalizeProduct(item.product), settings, styleId, toneId,
+          durationKey: 15, platformId, temperature, avoidHooks, signal: ac.signal,
+          onStep: text => setStep(`第 ${batch.findIndex(row => row.id === item.id) + 1}/5 条：${text}`),
+          publication: item.publication,
+        })
+        return { ...result, compliance: runCompliance(result.script), meta: {
+          productName: item.product.name, platform: PLATFORMS[platformId]?.name,
+          duration: 15, styleEmoji: getStyle(styleId)?.emoji,
+        } }
+      }, (id, patch) => updateItem(id, item => ({ ...item, ...patch })), ac.signal)
+    } finally {
       setBusy(false)
       setStep('')
     }
@@ -213,8 +227,20 @@ export default function App() {
 
       <main className="layout">
         <section className="panel form-panel">
+          <div className="actions">
+            <button disabled={busy} className={mode === 'single' ? 'primary' : 'ghost'} onClick={() => setMode('single')}>单商品</button>
+            <button disabled={busy} className={mode === 'batch' ? 'primary' : 'ghost'} onClick={() => setMode('batch')}>5条批量 · 15秒</button>
+          </div>
+          <fieldset disabled={busy} className="batch-fieldset">
           <h2 className="panel-title">① 商品信息</h2>
-          <ProductForm product={product} setProduct={setProduct} onDemo={() => setProduct({ ...DEMO, _sp: DEMO.sellingPoints.join('\n'), _sc: DEMO.scenarios.join('\n') })} />
+          {mode === 'single' ? <ProductForm product={product} setProduct={setProduct} onDemo={() => setProduct({ ...DEMO, _sp: DEMO.sellingPoints.join('\n'), _sc: DEMO.scenarios.join('\n') })} /> : batch.map((item, index) => (
+            <details className="batch-card" key={item.id} open={index === 0 ? true : undefined}>
+              <summary>第 {index + 1} 条 · {item.product.name || '待填写'}</summary>
+              <button className="ghost sm" onClick={() => updateProduct(item.id, () => ({ ...product }))}>复制单商品信息，再修改卖点</button>
+              <ProductForm product={item.product} setProduct={updater => updateProduct(item.id, updater)} onDemo={() => updateProduct(item.id, () => ({ ...DEMO, _sp: DEMO.sellingPoints.join('\n'), _sc: DEMO.scenarios.join('\n') }))} />
+              <PublicationForm value={item.publication} onChange={publication => updateItem(item.id, row => ({ ...row, publication }))} />
+            </details>
+          ))}
 
           <h2 className="panel-title" style={{ marginTop: 18 }}>② 选择短剧风格</h2>
           <p className="hint">不同风格 = 不同叙事结构与植入策略。产品会作为剧情必需品自然出现。</p>
@@ -223,7 +249,7 @@ export default function App() {
           <h2 className="panel-title" style={{ marginTop: 18 }}>③ 发布参数</h2>
           <div className="grid2">
             <Field label="时长">
-              <select value={durationKey} onChange={(e) => setDurationKey(Number(e.target.value))}>
+              <select disabled={mode === 'batch'} value={mode === 'batch' ? 15 : durationKey} onChange={(e) => setDurationKey(Number(e.target.value))}>
                 {Object.values(DURATIONS).map((d) => (
                   <option key={d.key} value={d.key}>{d.label}</option>
                 ))}
@@ -252,9 +278,10 @@ export default function App() {
             换一种开场（避免与上一条脚本重复）
           </label>
 
+          </fieldset>
           <div className="actions">
             {!busy ? (
-              <button className="primary" onClick={generate}>🚀 生成短剧带货脚本</button>
+              <button className="primary" onClick={() => mode === 'batch' ? generateBatch() : generate()}>🚀 {mode === 'batch' ? '生成全部5条（15秒）' : '生成短剧带货脚本'}</button>
             ) : (
               <button className="danger" onClick={cancel}>■ 取消生成</button>
             )}
@@ -265,6 +292,7 @@ export default function App() {
 
         <section className="panel result-panel">
           <h2 className="panel-title">结果</h2>
+          {mode === 'batch' ? <BatchResults items={batch} busy={busy} onRetry={generateBatch} updateItem={updateItem} /> : <>
           {!script && !loading && <EmptyState />}
           {script && (
             <ResultView
@@ -276,6 +304,7 @@ export default function App() {
               fixing={busy && step.includes('合规')}
             />
           )}
+          </>}
         </section>
       </main>
 
@@ -533,7 +562,7 @@ function ResultView({ script, painMap, compliance, meta, onFix, fixing }) {
                     <li key={i}><b>「{h.word}」</b>（{h.category}·{h.severity === 'high' ? '高危' : '中危'}）→ {h.suggestion}</li>
                   ))}
                 </ul>
-                <button className="primary sm" disabled={fixing} onClick={onFix}>{fixing ? '改写中…' : '🔧 一键合规改写'}</button>
+                <button className="primary sm" disabled={fixing || !onFix} onClick={onFix}>{fixing ? '改写中…' : '🔧 一键合规改写'}</button>
               </>
             )}
           </Block>
@@ -550,4 +579,38 @@ function Block({ title, children }) {
       <div className="block-body">{children}</div>
     </div>
   )
+}
+
+function PublicationForm({ value, onChange }) {
+  const set = (key, next) => onChange({ ...value, [key]: next })
+  return <div className="form">
+    <Field label="挂车状态（手动确认）"><select value={value.cartStatus} onChange={e => set('cartStatus', e.target.value)}>
+      <option value="pending">待确认</option><option value="on">挂车</option><option value="off">不挂车</option>
+    </select></Field>
+    <Field label="标题（20字以内，可留空生成）"><input value={value.title} onChange={e => set('title', e.target.value)} /></Field>
+    <Field label="话题（最多5个，空格分隔，可留空生成）"><input value={value.topics.join(' ')} onChange={e => set('topics', e.target.value.split(/\s+/).filter(Boolean))} /></Field>
+    <Field label="购物车标题（10字以内，可留空生成）"><input value={value.cartTitle} onChange={e => set('cartTitle', e.target.value)} /></Field>
+    <Field label="发布时间（北京时间，手动确认）"><input type="datetime-local" value={value.publishTime} onChange={e => set('publishTime', e.target.value)} /></Field>
+    {(Array.from(value.title).length > 20 || value.topics.length > 5 || Array.from(value.cartTitle).length > 10) && <p className="warn">请缩短标题至20字、购物车标题至10字，话题最多5个。</p>}
+  </div>
+}
+
+function BatchResults({ items, busy, onRetry, updateItem }) {
+  const labels = { pending: '待生成', running: '生成中', success: '已完成', error: '失败', cancelled: '已取消' }
+  return <div>
+    <p className="hint">已完成 {items.filter(item => item.status === 'success').length}/5。导出保留全部5条及失败状态；标题、话题为草稿，挂车和时间需确认。</p>
+    <div className="result-toolbar">
+      <button className="ghost sm" disabled={busy} onClick={() => download('五条短剧带货.md', toBatchMarkdown(items), 'text/markdown')}>导出批量 Markdown</button>
+      <button className="ghost sm" disabled={busy} onClick={() => download('五条短剧带货.json', toBatchJSON(items), 'application/json')}>导出批量 JSON</button>
+    </div>
+    {items.map((item, index) => <details className="batch-card" key={item.id}>
+      <summary>第 {index + 1} 条 · {item.product.name || '待填写'} · {labels[item.status]}</summary>
+      {item.error && <p className="err">{item.error}</p>}
+      <fieldset disabled={busy} className="batch-fieldset">
+        <PublicationForm value={item.publication} onChange={publication => updateItem(item.id, row => ({ ...row, publication }))} />
+      </fieldset>
+      <button className="ghost sm" disabled={busy} onClick={() => onRetry(item.id)}>重新生成这一条</button>
+      {item.script && <ResultView script={item.script} painMap={item.painMap} compliance={item.compliance || []} meta={item.meta} />}
+    </details>)}
+  </div>
 }

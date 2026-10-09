@@ -77,3 +77,27 @@ export function download(filename, content, type = 'text/plain') {
   document.body.removeChild(a)
   URL.revokeObjectURL(url)
 }
+
+// Preserve all rows, including failures, and reuse the existing single-script renderer.
+export function toBatchMarkdown(items) {
+  const cart = { pending: '待确认', on: '挂车', off: '不挂车' }
+  return ['# 五条短剧带货 · 15秒批量', '发布时间时区：Asia/Shanghai（北京时间）。发布文案为草稿，需人工确认。', ...items.map((item, index) => {
+    const p = item.publication
+    return [
+      `## 第 ${index + 1} 条 · ${item.product.name || '待填写'}`,
+      `- 生成状态：${item.status}`,
+      `- 挂车状态：${cart[p.cartStatus] || '待确认'}`,
+      `- 标题：${p.title || '待确认'}`,
+      `- 话题：${p.topics.join(' ') || '待确认'}`,
+      `- 购物车标题：${p.cartTitle || '待确认'}`,
+      `- 发布时间：${p.publishTime || '待确认'}（北京时间）`,
+      item.error ? `- 错误：${item.error}` : '',
+      item.compliance?.length ? `- 风险词：${item.compliance.map(hit => hit.word).join('、')}` : '',
+      toMarkdown(item.script, item.meta || { productName: item.product.name, duration: 15 }),
+    ].filter(Boolean).join('\n\n')
+  })].join('\n\n---\n\n')
+}
+
+export function toBatchJSON(items) {
+  return JSON.stringify({ version: 1, duration: 15, timezone: 'Asia/Shanghai', items }, null, 2)
+}
